@@ -1,0 +1,12 @@
+[profile "example"]
+# dx_cal_bot example
+Slack = "slack_token"
+Calendar = "calendar_id"
+
+
+
+[profile "other"]
+# dx_cal_bot other
+Slack = "other slack_token"
+Calendar = "other calendar_id"
+
