@@ -381,7 +381,6 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 
 	for {
 		msg := <-chMessage
-		fmt.Println("%s", msg.Type)
 		if msg.Text == "（╯°□°）╯︵(\\ .o.)\\" {
 			chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "ಠ_ಠ", Type: msg.Type}
 			id++
