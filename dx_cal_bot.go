@@ -429,7 +429,7 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 						log("Error at process: " + err.Error())
 						panic(err)
 					}
-					
+
 					if len(response["items"].([]interface{})) == 0 {
 						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "There are no calendar events scheduled for that week.", Type: msg.Type}
 					} else {
@@ -479,9 +479,9 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 		}
 
 		if len(response["items"].([]interface{})) == 0 {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "D04UW6TRN", Text: post + "There are no events happening today.", Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "There are no events happening today.", Type: "message"}
 		} else {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "D04UW6TRN", Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
 		}
 
 		id++
