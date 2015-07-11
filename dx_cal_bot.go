@@ -23,6 +23,7 @@ var CALENDAR_ID string
 var SLACK_TOKEN string
 var LOGFILE string
 var LOGLEN int64 = 0
+var TIMEZONE time.Location
 
 func setupAPIClient(keyfile, authURL string) (*http.Client, error) {
 	data, err := ioutil.ReadFile(keyfile)
@@ -187,7 +188,7 @@ func get_term_week(date time.Time) (int, int) {
 }
 
 func get_Wk1Monday(year, term int) time.Time {
-	first := time.Date(year, time.Month(term*3-2), 1, 0, 0, 0, 0, time.Local)
+	first := time.Date(year, time.Month(term*3-2), 1, 0, 0, 0, 0, TIMEZONE)
 	offset := int(time.Monday - first.Weekday())
 	return first.AddDate(0, 0, 14+offset)
 }
@@ -205,7 +206,7 @@ func getDateFromString(date []string) time.Time {
 	year, _ := strconv.Atoi(date[3])
 	month, _ := strconv.Atoi(date[1])
 	day, _ := strconv.Atoi(date[2])
-	return time.Date(year%2000+2000, time.Month(month), day, 0, 0, 0, 0, time.Local)
+	return time.Date(year%2000+2000, time.Month(month), day, 0, 0, 0, 0, TIMEZONE)
 }
 
 func get_date_from_term_week_wkday(year, term, week int, wkday time.Weekday) time.Time {
@@ -220,7 +221,7 @@ func getRange(rng string) (time.Time, time.Time, error) {
 	wkday, _ := regexp.Compile("(?i)((Sun)|(Mon)|(Tues?)|(Wed(?:nes)?)|(Thur?s?)|(Fri)|(Sat)|(Sun))(?:day)?")
 
 	now := time.Now()
-	startTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	startTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, TIMEZONE)
 	endTime := startTime.AddDate(0, 0, 1)
 
 	if date.MatchString(rng) {
@@ -302,7 +303,7 @@ func get_date_from_google_shit(input map[string]interface{}) (time.Time, error) 
 			return time.Parse(time.RFC3339, v.(string))
 		}
 	}
-	return time.Date(0, time.January, 1, 0, 0, 0, 0, time.Local), nil
+	return time.Date(0, time.January, 1, 0, 0, 0, 0, TIMEZONE), nil
 }
 
 func format_calendar_event(response map[string]interface{}) string {
@@ -428,7 +429,7 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 						log("Error at process: " + err.Error())
 						panic(err)
 					}
-					
+
 					if len(response["items"].([]interface{})) == 0 {
 						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "There are no calendar events scheduled for that week.", Type: msg.Type}
 					} else {
@@ -453,11 +454,11 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 	for {
 		t := time.Now()
 		if t.Hour() < 7 {
-			next_morning = time.Date(t.Year(), t.Month(), t.Day(), 7, 0, 0, 0, time.Local)
+			next_morning = time.Date(t.Year(), t.Month(), t.Day(), 7, 0, 0, 0, TIMEZONE)
 		} else {
-			next_morning = time.Date(t.Year(), t.Month(), t.Day()+1, 7, 0, 0, 0, time.Local)
+			next_morning = time.Date(t.Year(), t.Month(), t.Day()+1, 7, 0, 0, 0, TIMEZONE)
 		}
-		day := time.Date(next_morning.Year(), next_morning.Month(), next_morning.Day(), 0, 0, 0, 0, time.Local)
+		day := time.Date(next_morning.Year(), next_morning.Month(), next_morning.Day(), 0, 0, 0, 0, TIMEZONE)
 		args["timeMin"] = day.Format(time.RFC3339)
 		args["timeMax"] = day.AddDate(0, 0, 1).Format(time.RFC3339)
 
@@ -546,7 +547,7 @@ func main() {
 	}
 	CALENDAR_ID = cfg.Profile[team].Calendar
 	SLACK_TOKEN = cfg.Profile[team].Slack
-
+	TIMEZONE = time.LoadLocation("America/Detroit")
 	gApi, err := setupAPIClient(key, "https://www.googleapis.com/auth/calendar")
 	if err != nil {
 		log("Error @ main: " + err.Error())
