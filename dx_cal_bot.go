@@ -452,7 +452,7 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 	var next_morning time.Time
 
 	for {
-		t := time.Now()
+		t := time.Now().Local()
 		if t.Hour() < 7 {
 			next_morning = time.Date(t.Year(), t.Month(), t.Day(), 7, 0, 0, 0, time.Local)
 		} else {
