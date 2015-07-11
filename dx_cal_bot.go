@@ -452,7 +452,7 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 	var next_morning time.Time
 
 	for {
-		t := time.Now()
+		t := time.Now().Local()
 		if t.Hour() < 7 {
 			next_morning = time.Date(t.Year(), t.Month(), t.Day(), 7, 0, 0, 0, TIMEZONE)
 		} else {
@@ -479,9 +479,9 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 		}
 
 		if len(response["items"].([]interface{})) == 0 {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "D04UW6TRN", Text: post + "There are no events happening today.", Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "There are no events happening today.", Type: "message"}
 		} else {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "D04UW6TRN", Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
 		}
 
 		id++
