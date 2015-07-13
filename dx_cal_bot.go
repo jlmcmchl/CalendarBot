@@ -23,7 +23,7 @@ var CALENDAR_ID string
 var SLACK_TOKEN string
 var LOGFILE string
 var LOGLEN int64 = 0
-var TIMEZONE time.Location
+var TIMEZONE *time.Location
 
 func setupAPIClient(keyfile, authURL string) (*http.Client, error) {
 	data, err := ioutil.ReadFile(keyfile)
@@ -217,7 +217,7 @@ func get_date_from_term_week_wkday(year, term, week int, wkday time.Weekday) tim
 func getRange(rng string) (time.Time, time.Time, error) {
 	date, _ := regexp.Compile("(\\d{1,2})[-/ ](\\d{1,2})[-/ ]((?:\\d\\d){1,2})")
 	kulang, _ := regexp.Compile("(?i)((?:[a-zA-Z]+ ?(?:\\d\\d){1,2}?)?) ?w(?:ee)?k ?(\\d{1,2}) ?([a-z]+)?")
-	season_year, _ := regexp.Compile("(?i)(\\w+) ?(\\d*)")
+	season_year, _ := regexp.Compile("(?i)((Spring)|(Summer)|(Fall)|(Autumn)|(Winter)) ?(\\d*)")
 	wkday, _ := regexp.Compile("(?i)((Sun)|(Mon)|(Tues?)|(Wed(?:nes)?)|(Thur?s?)|(Fri)|(Sat)|(Sun))(?:day)?")
 
 	now := time.Now()
@@ -399,19 +399,19 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 					res := fully_defined.FindStringSubmatch(v[2])
 					startTime, _, err = getRange(res[1])
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>", res[1], msg.UserId), Type: msg.Type}
+						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[1], msg.UserId, err), Type: msg.Type}
 						id++
 					}
 
 					endTime, _, err = getRange(res[2])
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>", res[2], msg.UserId), Type: msg.Type}
+						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[2], msg.UserId, err), Type: msg.Type}
 						id++
 					}
 				} else {
 					startTime, endTime, err = getRange(v[2])
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>", v[2], msg.UserId), Type: msg.Type}
+						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", v[2], msg.UserId, err), Type: msg.Type}
 						id++
 					}
 				}
@@ -547,7 +547,11 @@ func main() {
 	}
 	CALENDAR_ID = cfg.Profile[team].Calendar
 	SLACK_TOKEN = cfg.Profile[team].Slack
-	TIMEZONE = time.LoadLocation("America/Detroit")
+	TIMEZONE, err = time.LoadLocation("America/Detroit")
+	if err != nil {
+		log("Error @ main: " + err.Error())
+		panic(err)
+	}
 	gApi, err := setupAPIClient(key, "https://www.googleapis.com/auth/calendar")
 	if err != nil {
 		log("Error @ main: " + err.Error())
