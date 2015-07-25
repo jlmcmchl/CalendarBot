@@ -217,7 +217,7 @@ func get_date_from_term_week_wkday(year, term, week int, wkday time.Weekday) tim
 func getRange(rng string) (time.Time, time.Time, error) {
 	date, _ := regexp.Compile("(\\d{1,2})[-/ ](\\d{1,2})[-/ ]((?:\\d\\d){1,2})")
 	kulang, _ := regexp.Compile("(?i)((?:[a-zA-Z]+ ?(?:\\d\\d){1,2}?)?) ?w(?:ee)?k ?(\\d{1,2}) ?([a-z]+)?")
-	season_year, _ := regexp.Compile("(?i)((Spring)|(Summer)|(Fall)|(Autumn)|(Winter)) ?(\\d*)")
+	season_year, _ := regexp.Compile("(?i)((Spring)|(Summer)|(Fall)|(Autumn)|(Winter)) ?(\\d*)?")
 	wkday, _ := regexp.Compile("(?i)((Sun)|(Mon)|(Tues?)|(Wed(?:nes)?)|(Thur?s?)|(Fri)|(Sat)|(Sun))(?:day)?")
 
 	now := time.Now()
@@ -488,6 +488,62 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 	}
 }
 
+func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) {
+	args := make(map[string]string)
+	args["calendarId"] = CALENDAR_ID
+	id := 0
+	var next_morning time.Time
+	var midnight time.Time
+
+	for {
+		t := time.Now().In(TIMEZONE)
+		midnight = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, TIMEZONE)
+		next_morning = midnight.AddDate(0, 0, 1)
+		
+		args["timeMin"] = midnight.Format(time.RFC3339)
+		args["timeMax"] = next_morning.Format(time.RFC3339)
+
+		resp, err := call(gApi, "/calendars/{calendarId}/events", args)
+		if err != nil {
+			log("Error at recurring_notifier: " + err.Error())
+			panic(err)
+		}
+
+		var response map[string]interface{}
+		if err := json.Unmarshal(resp, &response); err != nil {
+			log("Error at recurring_notifier: " + err.Error())
+			panic(err)
+		}
+		
+		for _, entry := range response["items"].([]interface{}) {
+			event := entry.(map[string]interface{})
+			for k,v := range event["start"].(map[string]string) {
+				switch k {
+				case "dateTime":
+					start, err := time.Parse(time.RFC3339, v)
+					if err != nil {
+						log("Error parsing date from google: " + v)
+					} else {
+						if start.Sub(t) > 0 {
+							go wait_to_notify(event, start, time.Hour, id, chSender)
+							id++
+							go wait_to_notify(event, start, time.Minute * 10, id, chSender)
+							id++
+						}
+					}
+				}
+			}
+			
+		}
+		time.Sleep(next_morning.Sub(time.Now().In(TIMEZONE)))
+	}
+}
+
+func wait_to_notify(event map[string]interface{}, start time.Time, before time.Duration, id int, chSender chan slack.OutgoingMessage) {
+	time.Sleep(start.Add(before * -1).Sub(time.Now().In(TIMEZONE)))
+	chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: fmt.Sprintf("Hey Guys! Dont forget, %s is coming up in %v!:\n", event["summary"].(string), before), Type: "message"}
+}
+
 func log(log string) {
 	bytes := []byte(time.Now().Format(time.RFC3339) + " " + log + "\n")
 	logFile, err := os.OpenFile(LOGFILE, os.O_RDWR, 0666)
@@ -577,6 +633,7 @@ func main() {
 	}(wsAPI, chSender)
 
 	go update_every_morning(gApi, chSender)
+	go recurring_notifier(gApi, chSender)
 
 	receiver(chReceiver, chMessage)
 
