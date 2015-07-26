@@ -517,12 +517,12 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 		
 		for _, entry := range response["items"].([]interface{}) {
 			event := entry.(map[string]interface{})
-			for k,v := range event["start"].(map[string]string) {
+			for k,v := range event["start"].(map[string]interface{}) {
 				switch k {
 				case "dateTime":
-					start, err := time.Parse(time.RFC3339, v)
+					start, err := time.Parse(time.RFC3339, v.(string))
 					if err != nil {
-						log("Error parsing date from google: " + v)
+						log("Error parsing date from google: " + v.(string))
 					} else {
 						if start.Sub(t) > 0 {
 							go wait_to_notify(event, start, time.Hour, id, chSender)
