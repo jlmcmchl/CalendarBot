@@ -19,8 +19,20 @@ import (
 	"time"
 )
 
-var CALENDAR_ID string
-var SLACK_TOKEN string
+type ConfigFile struct {
+	Profile map[string]*struct {
+		Slack            string
+		Default_Channel  string
+		Default_Calendar string
+		Calendar_Name    []string
+		Calendar         []string
+	}
+}
+
+var CONFIG ConfigFile
+var TEAM string
+var KEY string
+var CFGFILE string
 var LOGFILE string
 var LOGLEN int64 = 0
 var TIMEZONE *time.Location
@@ -49,6 +61,7 @@ func call(client *http.Client, method string, args map[string]string) ([]byte, e
 	if err != nil {
 		return nil, err
 	}
+
 	json := make([]byte, response.ContentLength)
 	buffer := make([]byte, response.ContentLength)
 	running_length := 0
@@ -224,7 +237,11 @@ func getRange(rng string) (time.Time, time.Time, error) {
 	startTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, TIMEZONE)
 	endTime := startTime.AddDate(0, 0, 1)
 
-	if date.MatchString(rng) {
+	if rng == "today" {
+		return startTime, endTime, nil
+	} else if strings.Trim(rng, " \t\r\n\v") == "" {
+		return startTime, startTime.AddDate(0, 0, 7), nil
+	} else if date.MatchString(rng) {
 		startTime = getDateFromString(date.FindStringSubmatch(rng))
 		endTime = startTime.AddDate(0, 0, 1)
 	} else if kulang.MatchString(rng) {
@@ -312,11 +329,15 @@ func format_calendar_event(response map[string]interface{}) string {
 	sort.Sort(Events(items))
 
 	table := make([][4]string, len(items))
+	fmt.Printf("Found this many events at that time:\t%d", len(items))
 
 	for i, v := range items {
 		d := v.(map[string]interface{})
 		a, _ := get_date_from_google_shit(d["start"].(map[string]interface{}))
 		e, _ := get_date_from_google_shit(d["end"].(map[string]interface{}))
+		if d["summary"] == nil  {
+			continue
+		}
 		b := d["summary"].(string)
 		if len(b) > 30 {
 			b = b[:27] + "..."
@@ -369,16 +390,16 @@ func format_calendar_event(response map[string]interface{}) string {
 }
 
 func Max(a, b int) int {
-	if a > b {
-		return a
+	if b < a {
+		return b
 	}
-	return b
+	return a
 }
 
 func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMessage, gApi *http.Client) {
 	id := 1
-	rx, _ := regexp.Compile("(?:\\s|(?:--)|^)\\^(\\w+)\\s?(.+)?(?:(?:--)|$)")
-	fully_defined, _ := regexp.Compile("(.+) to (.+)")
+	rx, _ := regexp.Compile("^\\^(\\w+)\\s?(.+)?$")
+	fully_defined, _ := regexp.Compile("(.+) ((to)|(->)) (.+)")
 
 	for {
 		msg := <-chMessage
@@ -391,10 +412,27 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 			case "hello":
 				chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "Hello, world!", Type: msg.Type}
 				id++
+			case "hype":
+				chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "Hype!", Type: msg.Type}
+				id++
 			case "events":
 				args := make(map[string]string)
 				var err error
 				var startTime, endTime time.Time
+
+				all_calendars := strings.Contains(v[2], "all")
+				cal_id := CONFIG.Profile[TEAM].Default_Calendar
+
+				if !all_calendars {
+					for i, cal_name := range CONFIG.Profile[TEAM].Calendar_Name {
+						if strings.Contains(v[2], strings.ToLower(cal_name)) {
+							cal_id = CONFIG.Profile[TEAM].Calendar[i]
+							v[2] = strings.Replace(v[2], cal_name, "", -1)
+							break
+						}
+					}
+				}
+
 				if fully_defined.MatchString(v[2]) {
 					res := fully_defined.FindStringSubmatch(v[2])
 					startTime, _, err = getRange(res[1])
@@ -403,7 +441,12 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 						id++
 					}
 
-					endTime, _, err = getRange(res[2])
+					if res[2] == "to" {
+						endTime, _, err = getRange(res[3])
+					} else {
+						_, endTime, err = getRange(res[3])
+					}
+
 					if err != nil {
 						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[2], msg.UserId, err), Type: msg.Type}
 						id++
@@ -417,7 +460,7 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 				}
 
 				if err == nil {
-					args["calendarId"] = CALENDAR_ID
+					args["calendarId"] = cal_id
 					args["timeMin"] = startTime.Format(time.RFC3339)
 					args["timeMax"] = endTime.Format(time.RFC3339)
 					resp, err := call(gApi, "/calendars/{calendarId}/events", args)
@@ -447,7 +490,7 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 
 func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage) {
 	args := make(map[string]string)
-	args["calendarId"] = CALENDAR_ID
+	args["calendarId"] = CONFIG.Profile[TEAM].Default_Calendar
 	id := 0
 	var next_morning time.Time
 
@@ -479,9 +522,9 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 		}
 
 		if len(response["items"].([]interface{})) == 0 {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "There are no events happening today.", Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: post + "There are no events happening today.", Type: "message"}
 		} else {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
+			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
 		}
 
 		id++
@@ -490,7 +533,7 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 
 func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) {
 	args := make(map[string]string)
-	args["calendarId"] = CALENDAR_ID
+	args["calendarId"] = CONFIG.Profile[TEAM].Default_Calendar
 	id := 0
 	var next_morning time.Time
 	var midnight time.Time
@@ -499,7 +542,7 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 		t := time.Now().In(TIMEZONE)
 		midnight = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, TIMEZONE)
 		next_morning = midnight.AddDate(0, 0, 1)
-		
+
 		args["timeMin"] = midnight.Format(time.RFC3339)
 		args["timeMax"] = next_morning.Format(time.RFC3339)
 
@@ -514,10 +557,10 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 			log("Error at recurring_notifier: " + err.Error())
 			panic(err)
 		}
-		
+
 		for _, entry := range response["items"].([]interface{}) {
 			event := entry.(map[string]interface{})
-			for k,v := range event["start"].(map[string]interface{}) {
+			for k, v := range event["start"].(map[string]interface{}) {
 				switch k {
 				case "dateTime":
 					start, err := time.Parse(time.RFC3339, v.(string))
@@ -527,13 +570,13 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 						if start.Sub(t) > 0 {
 							go wait_to_notify(event, start, time.Hour, id, chSender)
 							id++
-							go wait_to_notify(event, start, time.Minute * 10, id, chSender)
+							go wait_to_notify(event, start, time.Minute*10, id, chSender)
 							id++
 						}
 					}
 				}
 			}
-			
+
 		}
 		time.Sleep(next_morning.Sub(time.Now().In(TIMEZONE)))
 	}
@@ -541,7 +584,7 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 
 func wait_to_notify(event map[string]interface{}, start time.Time, before time.Duration, id int, chSender chan slack.OutgoingMessage) {
 	time.Sleep(start.Add(before * -1).Sub(time.Now().In(TIMEZONE)))
-	chSender <- slack.OutgoingMessage{Id: 0, ChannelId: "C04PMF9PX", Text: fmt.Sprintf("Hey Guys! Dont forget, %s is coming up in %v!:\n", event["summary"].(string), before), Type: "message"}
+	chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: fmt.Sprintf("Hey Guys! Dont forget, %s is coming up in %v!:\n", event["summary"].(string), before), Type: "message"}
 }
 
 func log(log string) {
@@ -561,27 +604,18 @@ func log(log string) {
 	LOGLEN += int64(written)
 }
 
-type Config struct {
-	Profile map[string]*struct {
-		Slack    string
-		Calendar string
-	}
-}
-
-var team, key, config string
-
 func init() {
-	flag.StringVar(&key, "key", "key.json", "Calendar Api Key")
-	flag.StringVar(&key, "k", "key.json", "Calendar Api Key (shorthand)")
-	flag.StringVar(&config, "config", "config.gcfg", "Config File Name")
-	flag.StringVar(&config, "c", "config.gcfg", "Config File Name (shorthand)")
+	flag.StringVar(&KEY, "key", "key.json", "Calendar Api Key")
+	flag.StringVar(&KEY, "k", "key.json", "Calendar Api Key (shorthand)")
+	flag.StringVar(&CFGFILE, "config", "config.gcfg", "Config File Name")
+	flag.StringVar(&CFGFILE, "c", "config.gcfg", "Config File Name (shorthand)")
 }
 
 func main() {
 	flag.Parse()
 	for i, arg := range os.Args[1:] {
 		if os.Args[i][0] != '-' || strings.Contains(os.Args[i], "=") || arg[0] != '-' {
-			team = arg
+			TEAM = arg
 			break
 		}
 	}
@@ -595,20 +629,22 @@ func main() {
 		panic(err)
 	}
 
-	var cfg Config
-	err = gcfg.ReadFileInto(&cfg, config)
+	err = gcfg.ReadFileInto(&CONFIG, CFGFILE)
 	if err != nil {
 		log(err.Error())
 		panic(err)
 	}
-	CALENDAR_ID = cfg.Profile[team].Calendar
-	SLACK_TOKEN = cfg.Profile[team].Slack
+	for i,v := range CONFIG.Profile[TEAM].Calendar_Name {
+		fmt.Println(v + ":\t" + CONFIG.Profile[TEAM].Calendar[i])
+	}
+
 	TIMEZONE, err = time.LoadLocation("America/Detroit")
 	if err != nil {
 		log("Error @ main: " + err.Error())
 		panic(err)
 	}
-	gApi, err := setupAPIClient(key, "https://www.googleapis.com/auth/calendar")
+
+	gApi, err := setupAPIClient(KEY, "https://www.googleapis.com/auth/calendar")
 	if err != nil {
 		log("Error @ main: " + err.Error())
 		panic(err)
@@ -616,7 +652,7 @@ func main() {
 		log("Successfully loaded the Calendar API")
 	}
 
-	api := slack.New(SLACK_TOKEN)
+	api := slack.New(CONFIG.Profile[TEAM].Slack)
 	api.SetDebug(false)
 	wsAPI, _ := api.StartRTM("", "http://localhost/")
 
@@ -627,6 +663,7 @@ func main() {
 		for {
 			select {
 			case msg := <-chSender:
+				fmt.Printf("Sending Message: %s\n", msg.Text)
 				wsAPI.SendMessage(&msg)
 			}
 		}
@@ -636,5 +673,4 @@ func main() {
 	go recurring_notifier(gApi, chSender)
 
 	receiver(chReceiver, chMessage)
-
 }
