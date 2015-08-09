@@ -8,6 +8,7 @@ import (
 	"github.com/nlopes/slack"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/jwt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -29,22 +30,80 @@ type ConfigFile struct {
 	}
 }
 
+type InternalMessage struct {
+	*slack.MessageEvent
+	Outgoing *slack.OutgoingMessage
+}
+
+func allocInternalMessage() InternalMessage {
+	outgoing := new(slack.OutgoingMessage)
+	outgoing.Id = int(time.Now().UnixNano())
+	outgoing.ChannelId = CONFIG.Profile[TEAM].Default_Channel
+	outgoing.Type = "message"
+
+	return InternalMessage{new(slack.MessageEvent), outgoing}
+}
+
+func allocWithBoth(incoming *slack.MessageEvent, outgoing *slack.OutgoingMessage) InternalMessage {
+	return InternalMessage{incoming, outgoing}
+}
+
+func allocWithOutgoing(outgoing *slack.OutgoingMessage) InternalMessage {
+	return allocWithBoth(new(slack.MessageEvent), outgoing)
+}
+
+func allocWithIncoming(incoming *slack.MessageEvent) InternalMessage {
+	outgoing := new(slack.OutgoingMessage)
+	outgoing.Id = int(time.Now().UnixNano())
+	outgoing.ChannelId = incoming.ChannelId
+	outgoing.Type = incoming.Type
+
+	return allocWithBoth(incoming, outgoing)
+}
+
+type Events []interface{}
+
+func (e Events) Len() int {
+	return len(e)
+}
+
+func (e Events) Swap(i, j int) {
+	e[i], e[j] = e[j], e[i]
+}
+
+func (e Events) Less(i, j int) bool {
+	start := e[i].(map[string]interface{})["start"].(map[string]interface{})
+	end := e[j].(map[string]interface{})["end"].(map[string]interface{})
+
+	var a, b time.Time
+	a, _ = get_date_from_google_shit(start)
+	b, _ = get_date_from_google_shit(end)
+
+	return int64(a.Sub(b)) < 0
+}
+
 var CONFIG ConfigFile
 var TEAM string
 var KEY string
 var CFGFILE string
-var LOGFILE string
-var LOGLEN int64 = 0
 var TIMEZONE *time.Location
 
 func setupAPIClient(keyfile, authURL string) (*http.Client, error) {
-	data, err := ioutil.ReadFile(keyfile)
-	conf, err := google.JWTConfigFromJSON(data, authURL)
+	var data []byte
+	var err error
+	var conf *jwt.Config
+
+	data, err = ioutil.ReadFile(keyfile)
+	if err != nil {
+		conf, _ = google.JWTConfigFromJSON(data, authURL)
+	} else {
+		conf, err = google.JWTConfigFromJSON(data, authURL)
+	}
 
 	return conf.Client(oauth2.NoContext), err
 }
 
-func call(client *http.Client, method string, args map[string]string) ([]byte, error) {
+func call(client *http.Client, method string, args map[string]string, log chan string) ([]byte, error) {
 	if method[len(method)-1] != '?' {
 		method += "?"
 	}
@@ -55,13 +114,16 @@ func call(client *http.Client, method string, args map[string]string) ([]byte, e
 			method += k + "=" + v + "&"
 		}
 	}
-	log("Calling method: " + method)
+
+	log <- "CALL: Calling method: " + method
 	response, err := client.Get("https://www.googleapis.com/calendar/v3" + method)
-	log("Got Response, len: " + strconv.Itoa(int(response.ContentLength)))
+
+	log <- fmt.Sprintf("CALL: Got Response, len: %d", response.ContentLength)
 	if err != nil {
 		return nil, err
 	}
 
+	log <- "CALL: Moving Response to buffer"
 	json := make([]byte, response.ContentLength)
 	buffer := make([]byte, response.ContentLength)
 	running_length := 0
@@ -81,34 +143,31 @@ func call(client *http.Client, method string, args map[string]string) ([]byte, e
 	return json, nil
 }
 
-func receiver(chReceiver chan slack.SlackEvent, chMessage chan slack.MessageEvent) {
+func receiver(chReceiver chan slack.SlackEvent, chMessage chan InternalMessage, log chan string) {
 	for {
-		select {
-		case msg, ok := <-chReceiver:
-			if !ok {
-				return
-			}
-			fmt.Print("Event Received: ")
-			switch msg.Data.(type) {
-			case slack.HelloEvent:
-				//Ignore Hello, might want a DM to me
-			case *slack.MessageEvent:
-				a := msg.Data.(*slack.MessageEvent)
-				fmt.Printf("Message: %v", a)
-				chMessage <- *a
-			case *slack.PresenceChangeEvent:
-				a := msg.Data.(*slack.PresenceChangeEvent)
-				fmt.Printf("Presence Change: %v", a)
-			case slack.LatencyReport:
-				a := msg.Data.(slack.LatencyReport)
-				fmt.Printf("Current latency: %v", a.Value)
-			case *slack.SlackWSError:
-				error := msg.Data.(*slack.SlackWSError)
-				fmt.Printf("Error: %d - %s", error.Code, error.Msg)
-			default:
-				fmt.Printf("Unexpected: %v", msg.Data)
-			}
-			fmt.Println()
+		msg, ok := <-chReceiver
+		if !ok {
+			return
+		}
+		switch msg.Data.(type) {
+		case slack.HelloEvent:
+			//Ignore Hello, might want a DM to me
+		case *slack.MessageEvent:
+			a := allocWithIncoming(msg.Data.(*slack.MessageEvent))
+			chMessage <- a
+		//case *slack.PresenceChangeEvent:
+		//	a := msg.Data.(*slack.PresenceChangeEvent)
+		case slack.LatencyReport:
+			a := msg.Data.(slack.LatencyReport)
+
+			log <- fmt.Sprintf("RECEIVER: Current Latency Report: %v", a.Value)
+		case *slack.SlackWSError:
+			error := msg.Data.(*slack.SlackWSError)
+
+			log <- fmt.Sprintf("RECEIVER: Slack Error Message: %d - %s", error.Code, error.Msg)
+		default:
+
+			log <- fmt.Sprintf("RECEIVER: Unexpected / Don't Care: %+v", msg.Data)
 		}
 	}
 }
@@ -290,27 +349,6 @@ func getRange(rng string) (time.Time, time.Time, error) {
 	return startTime, endTime, nil
 }
 
-type Events []interface{}
-
-func (e Events) Len() int {
-	return len(e)
-}
-
-func (e Events) Swap(i, j int) {
-	e[i], e[j] = e[j], e[i]
-}
-
-func (e Events) Less(i, j int) bool {
-	start := e[i].(map[string]interface{})["start"].(map[string]interface{})
-	end := e[j].(map[string]interface{})["start"].(map[string]interface{})
-
-	var a, b time.Time
-	a, _ = get_date_from_google_shit(start)
-	b, _ = get_date_from_google_shit(end)
-
-	return int64(a.Sub(b)) < 0
-}
-
 func get_date_from_google_shit(input map[string]interface{}) (time.Time, error) {
 	for k, v := range input {
 		switch k {
@@ -326,16 +364,25 @@ func get_date_from_google_shit(input map[string]interface{}) (time.Time, error) 
 func format_calendar_event(response map[string]interface{}) string {
 
 	items := response["items"].([]interface{})
-	sort.Sort(Events(items))
+	var sortable []interface{}
+	for _, v := range items {
+		if v != nil && v.(map[string]interface{})["status"].(string) != "cancelled" {
+			sortable = append(sortable, v)
+		}
+	}
+	sort.Sort(Events(sortable))
+	items = sortable
+	if len(items) == 0 {
+		return ""
+	}
 
 	table := make([][4]string, len(items))
-	fmt.Printf("Found this many events at that time:\t%d", len(items))
 
 	for i, v := range items {
 		d := v.(map[string]interface{})
 		a, _ := get_date_from_google_shit(d["start"].(map[string]interface{}))
 		e, _ := get_date_from_google_shit(d["end"].(map[string]interface{}))
-		if d["summary"] == nil  {
+		if d["summary"] == nil {
 			continue
 		}
 		b := d["summary"].(string)
@@ -396,25 +443,25 @@ func Max(a, b int) int {
 	return a
 }
 
-func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMessage, gApi *http.Client) {
-	id := 1
+func process(chMessage chan InternalMessage, chSender chan InternalMessage, gApi *http.Client, log chan string) {
 	rx, _ := regexp.Compile("^\\^(\\w+)\\s?(.+)?$")
 	fully_defined, _ := regexp.Compile("(.+) ((to)|(->)) (.+)")
 
 	for {
 		msg := <-chMessage
 		if msg.Text == "（╯°□°）╯︵(\\ .o.)\\" {
-			chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "ಠ_ಠ", Type: msg.Type}
-			id++
+			msg.Outgoing.Text = "ಠ_ಠ"
+			chSender <- msg
+			continue
 		}
 		for _, v := range rx.FindAllStringSubmatch(msg.Text, -1) {
 			switch strings.ToLower(v[1]) {
 			case "hello":
-				chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "Hello, world!", Type: msg.Type}
-				id++
+				msg.Outgoing.Text = "Hello, world!"
+				chSender <- msg
 			case "hype":
-				chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "Hype!", Type: msg.Type}
-				id++
+				msg.Outgoing.Text = "Hype!"
+				chSender <- msg
 			case "events":
 				args := make(map[string]string)
 				var err error
@@ -437,8 +484,8 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 					res := fully_defined.FindStringSubmatch(v[2])
 					startTime, _, err = getRange(res[1])
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[1], msg.UserId, err), Type: msg.Type}
-						id++
+						msg.Outgoing.Text = fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[1], msg.UserId, err)
+						chSender <- msg
 					}
 
 					if res[2] == "to" {
@@ -448,14 +495,14 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 					}
 
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[2], msg.UserId, err), Type: msg.Type}
-						id++
+						msg.Outgoing.Text = fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", res[2], msg.UserId, err)
+						chSender <- msg
 					}
 				} else {
 					startTime, endTime, err = getRange(v[2])
 					if err != nil {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", v[2], msg.UserId, err), Type: msg.Type}
-						id++
+						msg.Outgoing.Text = fmt.Sprintf("'%s' isn't a date, <@%s>. Reason: %s", v[2], msg.UserId, err)
+						chSender <- msg
 					}
 				}
 
@@ -463,35 +510,42 @@ func process(chMessage chan slack.MessageEvent, chSender chan slack.OutgoingMess
 					args["calendarId"] = cal_id
 					args["timeMin"] = startTime.Format(time.RFC3339)
 					args["timeMax"] = endTime.Format(time.RFC3339)
-					resp, err := call(gApi, "/calendars/{calendarId}/events", args)
+					resp, err := call(gApi, "/calendars/{calendarId}/events", args, log)
 					if err != nil {
-						log("Error at process: " + err.Error())
+
+						log <- "PROCESS: Error at process: " + err.Error()
 					}
 					var response map[string]interface{}
 					if err := json.Unmarshal(resp, &response); err != nil {
-						log("Error at process: " + err.Error())
+
+						log <- "PROCESS: Error at process: " + err.Error()
 						panic(err)
 					}
 
 					if len(response["items"].([]interface{})) == 0 {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: "There are no calendar events scheduled for that week.", Type: msg.Type}
+						msg.Outgoing.Text = "There are no calendar events scheduled for that week."
+						chSender <- msg
 					} else {
-						chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: format_calendar_event(response), Type: msg.Type}
+						resp := format_calendar_event(response)
+						if resp == "" {
+							msg.Outgoing.Text = "There are no calendar events scheduled for that week."
+						} else {
+							msg.Outgoing.Text = resp
+						}
+						chSender <- msg
 					}
-					id++
 				}
 			default:
-				chSender <- slack.OutgoingMessage{Id: id, ChannelId: msg.ChannelId, Text: fmt.Sprintf("I don't understand what you said, <@%s>", msg.UserId), Type: msg.Type}
-				id++
+				msg.Outgoing.Text = fmt.Sprintf("I don't understand what you said, <@%s>", msg.UserId)
+				chSender <- msg
 			}
 		}
 	}
 }
 
-func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage) {
+func update_every_morning(gApi *http.Client, chSender chan InternalMessage, log chan string) {
 	args := make(map[string]string)
 	args["calendarId"] = CONFIG.Profile[TEAM].Default_Calendar
-	id := 0
 	var next_morning time.Time
 
 	for {
@@ -506,35 +560,46 @@ func update_every_morning(gApi *http.Client, chSender chan slack.OutgoingMessage
 		args["timeMax"] = day.AddDate(0, 0, 1).Format(time.RFC3339)
 
 		post := "Good Morning!\n"
+		msg := allocInternalMessage()
+
+		log <- fmt.Sprintf("MORNING_UPDATE: Making Request:\t%+v", args)
+		resp, err := call(gApi, "/calendars/{calendarId}/events", args, log)
+		if err != nil {
+
+			log <- "PMORNING_UPDATE: Error making Calendar Request: " + err.Error()
+			panic(err)
+		}
+
+		log <- "MORNING_UPDATE: Successfully Requested Calendar Events"
+
+		var response map[string]interface{}
+
+		log <- "MORNING_UPDATE: Converting Request to JSON"
+		err = json.Unmarshal(resp, &response)
+		if err != nil {
+
+			log <- "MORNING_UPDATE: Error converting response to JSON: " + err.Error()
+			panic(err)
+		}
+
+		log <- "MORNING_UPDATE: Successfully converted response to JSON"
+
+		if len(response["items"].([]interface{})) == 0 {
+			msg.Outgoing.Text = post + "There are no events happening today."
+		} else {
+			msg.Outgoing.Text = post + "Here are the events happening today:\n" + format_calendar_event(response)
+		}
 
 		time.Sleep(next_morning.Sub(t))
 
-		resp, err := call(gApi, "/calendars/{calendarId}/events", args)
-		if err != nil {
-			log("Error at update_every_morning: " + err.Error())
-			panic(err)
-		}
-
-		var response map[string]interface{}
-		if err := json.Unmarshal(resp, &response); err != nil {
-			log("Error at update_every_morning: " + err.Error())
-			panic(err)
-		}
-
-		if len(response["items"].([]interface{})) == 0 {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: post + "There are no events happening today.", Type: "message"}
-		} else {
-			chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: post + "Here are the events happening today:\n" + format_calendar_event(response), Type: "message"}
-		}
-
-		id++
+		log <- "MORNING_UPDATE: Posting Morning Message"
+		chSender <- msg
 	}
 }
 
-func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) {
+func recurring_notifier(gApi *http.Client, chSender chan InternalMessage, log chan string) {
 	args := make(map[string]string)
 	args["calendarId"] = CONFIG.Profile[TEAM].Default_Calendar
-	id := 0
 	var next_morning time.Time
 	var midnight time.Time
 
@@ -546,62 +611,88 @@ func recurring_notifier(gApi *http.Client, chSender chan slack.OutgoingMessage) 
 		args["timeMin"] = midnight.Format(time.RFC3339)
 		args["timeMax"] = next_morning.Format(time.RFC3339)
 
-		resp, err := call(gApi, "/calendars/{calendarId}/events", args)
+		log <- fmt.Sprintf("NOTIFIER: Making Request:\t%+v", args)
+		resp, err := call(gApi, "/calendars/{calendarId}/events", args, log)
 		if err != nil {
-			log("Error at recurring_notifier: " + err.Error())
-			panic(err)
+
+			log <- "NOTIFIER: Error making Calendar Request: " + err.Error()
+			continue
 		}
 
 		var response map[string]interface{}
+
+		log <- "NOTIFIER: Converting response to JSON"
 		if err := json.Unmarshal(resp, &response); err != nil {
-			log("Error at recurring_notifier: " + err.Error())
-			panic(err)
+
+			log <- "NOTIFIER: Error converting response to JSON: " + err.Error()
+			continue
 		}
+
+		log <- "NOTIFIER: Successfully converted response to JSON"
 
 		for _, entry := range response["items"].([]interface{}) {
 			event := entry.(map[string]interface{})
+			if event["summary"] == nil {
+				continue
+			}
 			for k, v := range event["start"].(map[string]interface{}) {
 				switch k {
 				case "dateTime":
+
+					log <- "NOTIFIER: Found non-All-Day event, parsing time."
 					start, err := time.Parse(time.RFC3339, v.(string))
 					if err != nil {
-						log("Error parsing date from google: " + v.(string))
-					} else {
-						if start.Sub(t) > 0 {
-							go wait_to_notify(event, start, time.Hour, id, chSender)
-							id++
-							go wait_to_notify(event, start, time.Minute*10, id, chSender)
-							id++
-						}
+
+						log <- "NOTIFIER: Error parsing date from google: " + v.(string)
+						continue
+					}
+
+					log <- "NOTIFIER: Successfully parsed time. Setting up notifiers"
+					if start.Sub(t) > 0 {
+						go wait_to_notify(event, start, time.Hour, chSender)
+						go wait_to_notify(event, start, time.Minute*10, chSender)
 					}
 				}
 			}
-
 		}
 		time.Sleep(next_morning.Sub(time.Now().In(TIMEZONE)))
 	}
 }
 
-func wait_to_notify(event map[string]interface{}, start time.Time, before time.Duration, id int, chSender chan slack.OutgoingMessage) {
+func wait_to_notify(event map[string]interface{}, start time.Time, before time.Duration, chSender chan InternalMessage) {
+	msg := allocInternalMessage()
+	msg.Outgoing.Text = fmt.Sprintf("Hey Guys! Dont forget, %s is coming up in %v!:\n", event["summary"].(string), before)
+
 	time.Sleep(start.Add(before * -1).Sub(time.Now().In(TIMEZONE)))
-	chSender <- slack.OutgoingMessage{Id: 0, ChannelId: CONFIG.Profile[TEAM].Default_Channel, Text: fmt.Sprintf("Hey Guys! Dont forget, %s is coming up in %v!:\n", event["summary"].(string), before), Type: "message"}
+	chSender <- msg
 }
 
-func log(log string) {
-	bytes := []byte(time.Now().Format(time.RFC3339) + " " + log + "\n")
-	logFile, err := os.OpenFile(LOGFILE, os.O_RDWR, 0666)
-	if err != nil {
-		fmt.Println(err)
-		fmt.Println(log)
-		panic(err)
+func log(fname string, incoming chan string) {
+	var log string
+	var loglen int64
+
+	for {
+		log = <-incoming
+		bytes := []byte("[" + time.Now().Format(time.RFC3339) + "]:\t" + log + "\n")
+
+		logFile, err := os.OpenFile(fname, os.O_RDWR, 0666)
+		for {
+			if err == nil {
+				break
+			}
+			fmt.Println(err)
+			fmt.Println(log)
+			time.Sleep(time.Minute)
+			logFile, err = os.OpenFile(fname, os.O_RDWR, 0666)
+		}
+
+		written, err := logFile.WriteAt(bytes, loglen)
+		if err != nil {
+			fmt.Println(err)
+			fmt.Println(log)
+		}
+		loglen += int64(written)
 	}
-	written, err := logFile.WriteAt(bytes, LOGLEN)
-	if err != nil {
-		fmt.Println(err)
-		fmt.Println(log)
-		panic(err)
-	}
-	LOGLEN += int64(written)
 }
 
 func init() {
@@ -620,57 +711,65 @@ func main() {
 		}
 	}
 
-	chSender := make(chan slack.OutgoingMessage, 10)
+	chSender := make(chan InternalMessage, 10)
 	chReceiver := make(chan slack.SlackEvent, 10)
-	chMessage := make(chan slack.MessageEvent, 10)
-	LOGFILE = "log/" + time.Now().Format(time.RFC3339) + ".log"
-	_, err := os.Create(LOGFILE)
+	chMessage := make(chan InternalMessage, 10)
+	fname := time.Now().Format(time.RFC3339)
+
+	_, err := os.Create("log/" + fname + ".log")
 	if err != nil {
+		fmt.Println("STARTUP: Error at creating START logfile:\t" + err.Error())
 		panic(err)
 	}
+	chStart := make(chan string, 10)
+	go log("log/"+fname+".log", chStart)
 
 	err = gcfg.ReadFileInto(&CONFIG, CFGFILE)
 	if err != nil {
-		log(err.Error())
+		chStart <- "STARTUP: Error at loading config file:\t" + err.Error()
 		panic(err)
 	}
-	for i,v := range CONFIG.Profile[TEAM].Calendar_Name {
-		fmt.Println(v + ":\t" + CONFIG.Profile[TEAM].Calendar[i])
-	}
+	chStart <- "STARTUP: Successfully loaded the Config File:\t" + CFGFILE
 
 	TIMEZONE, err = time.LoadLocation("America/Detroit")
 	if err != nil {
-		log("Error @ main: " + err.Error())
+		chStart <- "STARTUP: Error at loading Timezone:\t" + err.Error()
 		panic(err)
 	}
 
 	gApi, err := setupAPIClient(KEY, "https://www.googleapis.com/auth/calendar")
 	if err != nil {
-		log("Error @ main: " + err.Error())
+		chStart <- "STARTUP: Error when loading the Calendar API:\t" + err.Error()
 		panic(err)
-	} else {
-		log("Successfully loaded the Calendar API")
 	}
+	chStart <- "STARTUP: Successfully loaded the Calendar API"
 
 	api := slack.New(CONFIG.Profile[TEAM].Slack)
 	api.SetDebug(false)
-	wsAPI, _ := api.StartRTM("", "http://localhost/")
+	wsAPI, err := api.StartRTM("", "http://localhost/")
+	if err != nil {
+		chStart <- "STARTUP: Error when starting websocket:\t" + err.Error()
+		panic(err)
+	}
+	chStart <- "STARTUP: Successfully opened the websocket"
 
 	go wsAPI.HandleIncomingEvents(chReceiver)
 	go wsAPI.Keepalive(20 * time.Second)
-	go process(chMessage, chSender, gApi)
-	go func(wsAPI *slack.SlackWS, chSender chan slack.OutgoingMessage) {
+	go process(chMessage, chSender, gApi, chStart)
+	go func(wsAPI *slack.SlackWS, outbox chan InternalMessage, log chan string) {
 		for {
 			select {
-			case msg := <-chSender:
-				fmt.Printf("Sending Message: %s\n", msg.Text)
-				wsAPI.SendMessage(&msg)
+			case msg := <-outbox:
+
+				log <- fmt.Sprintf("OUTBOX: Sending Message: %s\n", msg.Outgoing.Text)
+				wsAPI.SendMessage(msg.Outgoing)
 			}
 		}
-	}(wsAPI, chSender)
+	}(wsAPI, chSender, chStart)
 
-	go update_every_morning(gApi, chSender)
-	go recurring_notifier(gApi, chSender)
+	go update_every_morning(gApi, chSender, chStart)
+	go recurring_notifier(gApi, chSender, chStart)
+	chStart <- "STARTUP: Successfully loaded all main threads. Starting Receiver"
 
-	receiver(chReceiver, chMessage)
+	receiver(chReceiver, chMessage, chStart)
 }
