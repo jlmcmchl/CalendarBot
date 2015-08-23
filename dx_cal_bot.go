@@ -2,6 +2,7 @@ package main
 
 import (
 	"code.google.com/p/gcfg"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"golang.org/x/oauth2/jwt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net/http"
 	"os"
 	"regexp"
@@ -23,6 +25,7 @@ import (
 type ConfigFile struct {
 	Profile map[string]*struct {
 		Slack            string
+		Admin            []string
 		Default_Channel  string
 		Default_Calendar string
 		Calendar_Name    []string
@@ -86,7 +89,9 @@ var CONFIG ConfigFile
 var TEAM string
 var KEY string
 var CFGFILE string
+var QTEFILE string
 var TIMEZONE *time.Location
+var QUOTES []string
 
 func setupAPIClient(keyfile, authURL string) (*http.Client, error) {
 	var data []byte
@@ -535,6 +540,18 @@ func process(chMessage chan InternalMessage, chSender chan InternalMessage, gApi
 						chSender <- msg
 					}
 				}
+			case "restart":
+				if msg.UserId == CONFIG.Profile[TEAM].Admin[0] {
+					quote := quote()
+					msg.Outgoing.Text = quote
+					chSender <- msg
+					time.Sleep(time.Second)
+					panic(quote)
+				}
+			case "psycho": fallthrough
+			case "quote":
+				msg.Outgoing.Text = quote()
+				chSender <- msg
 			default:
 				msg.Outgoing.Text = fmt.Sprintf("I don't understand what you said, <@%s>", msg.UserId)
 				chSender <- msg
@@ -686,7 +703,7 @@ func log(fname string, incoming chan string) {
 			logFile, err = os.OpenFile(fname, os.O_RDWR, 0666)
 		}
 
-		written, err := logFile.WriteAt(bytes, loglen)
+		written, err := logFile.Write(bytes)
 		if err != nil {
 			fmt.Println(err)
 			fmt.Println(log)
@@ -695,11 +712,59 @@ func log(fname string, incoming chan string) {
 	}
 }
 
+func prep_quotes() {
+	stats, err := os.Stat(QTEFILE)
+	if err != nil {
+		fmt.Println("Failed to load quotes:")
+		fmt.Println(err)
+		panic(err)
+	}
+	quotefile, err := os.OpenFile(QTEFILE, os.O_RDONLY, 0666)
+	if err != nil {
+		fmt.Println("Failed to load quotes:")
+		fmt.Println(err)
+		panic(err)
+	}
+
+	qtes := make([]byte, stats.Size())
+	buffer := make([]byte, stats.Size())
+	running_length := 0
+	for int64(running_length) < stats.Size() {
+		length, err := quotefile.Read(buffer)
+		for i := 0; i < length; i++ {
+			qtes[running_length+i] = buffer[i]
+		}
+		running_length += length
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println("Failed to load quotes:")
+			fmt.Println(err)
+			panic(err)
+		}
+	}
+
+	QUOTES = strings.Split(string(qtes[:stats.Size()]), "\n")
+	quotefile.Close()
+}
+
+func quote() string {
+	val, err := rand.Int(rand.Reader, big.NewInt(int64(len(QUOTES))))
+	if err != nil {
+		fmt.Println("Failed to get random value:\n", err)
+		panic(err)
+	}
+	return QUOTES[val.Int64()]
+}
+
 func init() {
 	flag.StringVar(&KEY, "key", "key.json", "Calendar Api Key")
 	flag.StringVar(&KEY, "k", "key.json", "Calendar Api Key (shorthand)")
 	flag.StringVar(&CFGFILE, "config", "config.gcfg", "Config File Name")
 	flag.StringVar(&CFGFILE, "c", "config.gcfg", "Config File Name (shorthand)")
+	flag.StringVar(&QTEFILE, "quote", "quote.txt", "Quote File Name")
+	flag.StringVar(&QTEFILE, "q", "quote.txt", "Quote File Name (shorthand)")
 }
 
 func main() {
@@ -710,6 +775,8 @@ func main() {
 			break
 		}
 	}
+
+	prep_quotes()
 
 	chSender := make(chan InternalMessage, 10)
 	chReceiver := make(chan slack.SlackEvent, 10)
@@ -771,5 +838,8 @@ func main() {
 	go recurring_notifier(gApi, chSender, chStart)
 	chStart <- "STARTUP: Successfully loaded all main threads. Starting Receiver"
 
+	helloWorld := allocInternalMessage()
+	helloWorld.Outgoing.Text = quote()
+	chSender <- helloWorld
 	receiver(chReceiver, chMessage, chStart)
 }
