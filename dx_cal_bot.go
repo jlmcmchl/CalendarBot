@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"code.google.com/p/gcfg"
 	"crypto/rand"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -303,6 +305,8 @@ func getRange(rng string) (time.Time, time.Time, error) {
 
 	if rng == "today" {
 		return startTime, endTime, nil
+	} else if rng == "tomorrow" {
+		return endTime, endTime.AddDate(0, 0, 1), nil
 	} else if strings.Trim(rng, " \t\r\n\v") == "" {
 		return startTime, startTime.AddDate(0, 0, 7), nil
 	} else if date.MatchString(rng) {
@@ -421,19 +425,19 @@ func format_calendar_event(response map[string]interface{}) string {
 			}
 		}
 	}
+	fmt_string := fmt.Sprintf(" %%-12s | %%-12s | %%-%ds", max_lens[2])
 
 	reply := "``` Start        | End          | Event"
-	reply += strings.Repeat(" ", max_lens[2]-5)
+	reply += strings.Repeat(" ", Max(max_lens[2]-4, 1))
 	if max_lens[3] > 0 {
-		reply += " | Location"
+		fmt_string = fmt.Sprintf(" | %%-%ds", max_lens[3])
+		reply += "| Location"
 	}
 	reply += "\n" + strings.Repeat("-", len(reply)-3) + "\n"
 
 	for _, row := range table {
-		fmt_string := fmt.Sprintf(" %%-12s | %%-12s | %%-%ds", max_lens[2])
 		reply += fmt.Sprintf(fmt_string, row[0], row[1], row[2])
 		if max_lens[3] > 0 {
-			fmt_string = fmt.Sprintf(" | %%-%ds", max_lens[3])
 			reply += fmt.Sprintf(fmt_string, row[3])
 		}
 		reply += "\n"
@@ -442,7 +446,7 @@ func format_calendar_event(response map[string]interface{}) string {
 }
 
 func Max(a, b int) int {
-	if b < a {
+	if b > a {
 		return b
 	}
 	return a
@@ -684,31 +688,30 @@ func wait_to_notify(event map[string]interface{}, start time.Time, before time.D
 	chSender <- msg
 }
 
-func log(fname string, incoming chan string) {
+func log(fname *os.File, incoming chan string) {
 	var log string
-	var loglen int64
 
 	for {
+		writer := bufio.NewWriter(fname)
 		log = <-incoming
-		bytes := []byte("[" + time.Now().Format(time.RFC3339) + "]:\t" + log + "\n")
+		line := "[" + time.Now().Format(time.RFC3339) + "]:\t" + log
 
-		logFile, err := os.OpenFile(fname, os.O_RDWR, 0666)
-		for {
-			if err == nil {
-				break
-			}
-			fmt.Println(err)
-			fmt.Println(log)
-			time.Sleep(time.Minute)
-			logFile, err = os.OpenFile(fname, os.O_RDWR, 0666)
-		}
+		cmd := exec.Command("echo",  line)
+		stdoutPipe, err := cmd.StdoutPipe()
+    if err != nil {
+        fmt.Println(err)
+				continue
+    }
 
-		written, err := logFile.Write(bytes)
-		if err != nil {
-			fmt.Println(err)
-			fmt.Println(log)
-		}
-		loglen += int64(written)
+    err = cmd.Start()
+    if err != nil {
+        fmt.Println(err)
+				continue
+    }
+
+    go io.Copy(writer, stdoutPipe)
+    cmd.Wait()
+		writer.Flush()
 	}
 }
 
@@ -783,13 +786,13 @@ func main() {
 	chMessage := make(chan InternalMessage, 10)
 	fname := time.Now().Format(time.RFC3339)
 
-	_, err := os.Create("log/" + fname + ".log")
+	logFile, err := os.Create("log/" + fname + ".log")
 	if err != nil {
 		fmt.Println("STARTUP: Error at creating START logfile:\t" + err.Error())
 		panic(err)
 	}
 	chStart := make(chan string, 10)
-	go log("log/"+fname+".log", chStart)
+	go log(logFile, chStart)
 
 	err = gcfg.ReadFileInto(&CONFIG, CFGFILE)
 	if err != nil {
@@ -838,8 +841,5 @@ func main() {
 	go recurring_notifier(gApi, chSender, chStart)
 	chStart <- "STARTUP: Successfully loaded all main threads. Starting Receiver"
 
-	helloWorld := allocInternalMessage()
-	helloWorld.Outgoing.Text = quote()
-	chSender <- helloWorld
 	receiver(chReceiver, chMessage, chStart)
 }
